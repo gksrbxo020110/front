@@ -92,7 +92,7 @@ class _LoginScreenState extends State<LoginScreen> {
         _snack('로그인 실패: 아이디 또는 비밀번호를 확인해주세요');
       }
     } catch (e) {
-      _snack('서버 연결 실패: $e');
+      _snack(ApiService.connectionErrorText);
     } finally {
       if (mounted) setState(() => loading = false);
     }

@@ -218,7 +218,7 @@ class _WorkerDetailScreenState extends State<WorkerDetailScreen> {
     try {
       res = await ApiService.unblockWorker(widget.userId);
     } catch (e) {
-      res = {'success': false, 'body': '서버에 연결할 수 없어요'};
+      res = {'success': false, 'body': ApiService.connectionErrorText};
     }
     if (!mounted) return;
     setState(() => _unblocking = false);
@@ -234,7 +234,12 @@ class _WorkerDetailScreenState extends State<WorkerDetailScreen> {
     } else {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text('해제 실패: ${res['body']}'),
+          content: Text(
+            ApiService.errorText(
+              res['body'],
+              fallback: '출입 차단 해제에 실패했어요 · 다시 시도해주세요',
+            ),
+          ),
           duration: const Duration(seconds: 2),
         ),
       );
@@ -351,7 +356,12 @@ class _WorkerDetailScreenState extends State<WorkerDetailScreen> {
     } else {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text('해제 실패: ${res['body']}'),
+          content: Text(
+            ApiService.errorText(
+              res['body'],
+              fallback: '소속 해제에 실패했어요 · 다시 시도해주세요',
+            ),
+          ),
           duration: const Duration(seconds: 2),
         ),
       );

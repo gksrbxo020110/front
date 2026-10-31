@@ -459,7 +459,7 @@ class _GateDetectionScreenState extends State<GateDetectionScreen> {
       // 저장 사진은 실제 방향(좌우 반전 없음)
       final bytes = await compute(
         drawBoxesAndEncode,
-        BurnData.fromDetections(_lastImage!, _lastShown),
+        await BurnData.fromDetectionsKo(_lastImage!, _lastShown), // 한글 라벨
       );
 
       final urlRes = await ApiService.getS3UploadUrl();

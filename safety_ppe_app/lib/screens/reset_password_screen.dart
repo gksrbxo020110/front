@@ -48,7 +48,7 @@ class _ResetPasswordScreenState extends State<ResetPasswordScreen> {
         _snack('인증코드 발송 실패. 가입된 이메일인지 확인해주세요');
       }
     } catch (e) {
-      _snack('서버 연결 실패: $e');
+      _snack(ApiService.connectionErrorText);
     } finally {
       if (mounted) setState(() => loading = false);
     }
@@ -74,7 +74,7 @@ class _ResetPasswordScreenState extends State<ResetPasswordScreen> {
         _snack('인증코드가 올바르지 않습니다');
       }
     } catch (e) {
-      _snack('서버 연결 실패: $e');
+      _snack(ApiService.connectionErrorText);
     } finally {
       if (mounted) setState(() => loading = false);
     }
@@ -111,10 +111,15 @@ class _ResetPasswordScreenState extends State<ResetPasswordScreen> {
         Navigator.pop(context); // 로그인 화면으로
       } else {
         // 서버 메시지 그대로 (예: "아이디와 이메일이 일치하지 않습니다.")
-        _snack('재설정 실패: ${result['body']}');
+        _snack(
+          ApiService.errorText(
+            result['body'],
+            fallback: '비밀번호 재설정에 실패했어요 · 다시 시도해주세요',
+          ),
+        );
       }
     } catch (e) {
-      _snack('서버 연결 실패: $e');
+      _snack(ApiService.connectionErrorText);
     } finally {
       if (mounted) setState(() => loading = false);
     }

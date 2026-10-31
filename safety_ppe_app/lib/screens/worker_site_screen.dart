@@ -67,7 +67,7 @@ class _WorkerSiteScreenState extends State<WorkerSiteScreen> {
         _snack('등록 실패: 현장 코드를 확인해주세요');
       }
     } catch (e) {
-      _snack('서버 연결 실패: $e');
+      _snack(ApiService.connectionErrorText);
     } finally {
       if (mounted) setState(() => submitting = false);
     }
@@ -87,11 +87,16 @@ class _WorkerSiteScreenState extends State<WorkerSiteScreen> {
         });
         await _loadMySite();
       } else {
-        _snack('탈퇴 실패: ${result['body']}');
+        _snack(
+          ApiService.errorText(
+            result['body'],
+            fallback: '현장 탈퇴에 실패했어요 · 다시 시도해주세요',
+          ),
+        );
         setState(() => loading = false);
       }
     } catch (e) {
-      _snack('서버 연결 실패: $e');
+      _snack(ApiService.connectionErrorText);
       setState(() => loading = false);
     }
   }

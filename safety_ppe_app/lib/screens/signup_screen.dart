@@ -53,7 +53,7 @@ class _SignupScreenState extends State<SignupScreen> {
         _snack('중복 확인 실패. 다시 시도해주세요');
       }
     } catch (e) {
-      _snack('서버 연결 실패: $e');
+      _snack(ApiService.connectionErrorText);
     } finally {
       setState(() => loading = false);
     }
@@ -80,7 +80,7 @@ class _SignupScreenState extends State<SignupScreen> {
         _snack('중복 확인 실패. 다시 시도해주세요');
       }
     } catch (e) {
-      _snack('서버 연결 실패: $e');
+      _snack(ApiService.connectionErrorText);
     } finally {
       setState(() => loading = false);
     }
@@ -104,7 +104,7 @@ class _SignupScreenState extends State<SignupScreen> {
         _snack('인증코드 발송 실패. 이메일을 확인해주세요');
       }
     } catch (e) {
-      _snack('서버 연결 실패: $e');
+      _snack(ApiService.connectionErrorText);
     } finally {
       setState(() => loading = false);
     }
@@ -129,10 +129,29 @@ class _SignupScreenState extends State<SignupScreen> {
         _snack('인증코드가 올바르지 않습니다');
       }
     } catch (e) {
-      _snack('서버 연결 실패: $e');
+      _snack(ApiService.connectionErrorText);
     } finally {
       setState(() => loading = false);
     }
+  }
+
+  // 서버 에러 응답(JSON·에러 페이지 등) → 사용자용 한 줄 문구
+  // 서버 메시지: "이미 사용 중인 이메일입니다." / "...아이디입니다." / "...닉네임입니다."
+  //            "이메일 인증이 완료되지 않았습니다."
+  String _signupErrorMessage(String body) {
+    if (body.contains('이메일 인증')) {
+      return '이메일 인증이 완료되지 않았어요. 다시 인증해주세요';
+    }
+    if (body.contains('이메일')) {
+      return '이미 가입된 이메일이에요. 다른 이메일을 사용해주세요';
+    }
+    if (body.contains('아이디')) {
+      return '이미 사용 중인 아이디예요. 다른 아이디를 입력해주세요';
+    }
+    if (body.contains('닉네임')) {
+      return '이미 사용 중인 닉네임이에요. 다른 닉네임을 입력해주세요';
+    }
+    return '회원가입에 실패했어요. 잠시 후 다시 시도해주세요';
   }
 
   Future<void> _submit() async {
@@ -180,10 +199,10 @@ class _SignupScreenState extends State<SignupScreen> {
         _snack('회원가입이 완료되었습니다');
         Navigator.pop(context);
       } else {
-        _snack('회원가입 실패: ${result['body']}');
+        _snack(_signupErrorMessage(result['body']?.toString() ?? ''));
       }
     } catch (e) {
-      _snack('서버 연결 실패: $e');
+      _snack(ApiService.connectionErrorText);
     } finally {
       setState(() => loading = false);
     }

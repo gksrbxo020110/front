@@ -20,6 +20,9 @@ class _WorkerQrScreenState extends State<WorkerQrScreen> {
   String expireAtRaw = ''; // 원본 만료일 (갱신 화면에 넘길 용도)
   String name = '';
   String siteName = '';
+  bool hasSite = true; // 소속 현장 있는지 (없으면 QR 사용 불가)
+  // ※ 레드 등급은 앱에서 막지 않음: 출입 차단은 게이트 QR 검증에서 서버가 막고,
+  //   관리자가 해제하면 바로 입장 가능 (노동자 응답엔 차단 여부 값이 없어서)
 
   @override
   void initState() {
@@ -42,6 +45,12 @@ class _WorkerQrScreenState extends State<WorkerQrScreen> {
       if (info['success'] == true) {
         name = info['name'] ?? '';
         siteName = info['siteName'] ?? '';
+        hasSite = info['siteId'] != null;
+      }
+      // 현장 없음 → QR 조회 안 함 (화면에서 안내만)
+      if (!hasSite) {
+        setState(() => hasQr = false);
+        return;
       }
       // 내 QR 조회
       final qr = await ApiService.getMyQr();
@@ -99,16 +108,30 @@ class _WorkerQrScreenState extends State<WorkerQrScreen> {
   Future<void> _issue(int validDays) async {
     setState(() => loading = true);
     try {
+      // 발급 직전 한 번 더 확인 (그사이 현장 탈퇴됐을 수 있음)
+      final info = await ApiService.getMyInfo();
+      final bool siteOk = info['success'] == true && info['siteId'] != null;
+      if (!siteOk) {
+        _snack('소속 현장이 없어 QR을 발급할 수 없어요');
+        await _load();
+        return;
+      }
+
       final result = await ApiService.issueQr(validDays: validDays);
       if (result['success'] == true) {
         _snack('QR 코드가 발급되었습니다');
         await _load(); // 다시 조회
       } else {
-        _snack('QR 발급 실패: ${result['body']}');
+        _snack(
+          ApiService.errorText(
+            result['body'],
+            fallback: 'QR 발급에 실패했어요 · 다시 시도해주세요',
+          ),
+        );
         setState(() => loading = false);
       }
     } catch (e) {
-      _snack('서버 연결 실패: $e');
+      _snack(ApiService.connectionErrorText);
       setState(() => loading = false);
     }
   }
@@ -161,6 +184,13 @@ class _WorkerQrScreenState extends State<WorkerQrScreen> {
                   child: Center(
                     child: CircularProgressIndicator(color: Color(0xFF6FA8F5)),
                   ),
+                )
+              else if (!hasSite)
+                ..._qrBlocked(
+                  icon: Icons.location_off_outlined,
+                  color: const Color(0xFF9A9A9A),
+                  title: '소속 현장이 없어요',
+                  desc: '현장에 등록해야 QR 코드를 만들 수 있어요\n현장 관리에서 현장 코드로 등록하세요',
                 )
               else if (hasQr)
                 ..._qrExists()
@@ -236,6 +266,70 @@ class _WorkerQrScreenState extends State<WorkerQrScreen> {
               fontWeight: FontWeight.w600,
               color: Color(0xFF4A4A4A),
             ),
+          ),
+        ),
+      ),
+    ];
+  }
+
+  // QR 사용 불가 (현장 없음) — 생성·갱신 버튼 없음
+  List<Widget> _qrBlocked({
+    required IconData icon,
+    required Color color,
+    required String title,
+    required String desc,
+  }) {
+    return [
+      Container(
+        width: 220,
+        height: 220,
+        decoration: BoxDecoration(
+          color: const Color(0xFFF7F7F7),
+          border: Border.all(color: color, width: 2),
+          borderRadius: BorderRadius.circular(14),
+        ),
+        child: Icon(icon, size: 80, color: color),
+      ),
+      const SizedBox(height: 20),
+      Text(
+        title,
+        style: TextStyle(
+          fontSize: 15,
+          fontWeight: FontWeight.bold,
+          color: color == const Color(0xFFE24B4A) ? color : null,
+        ),
+      ),
+      const SizedBox(height: 6),
+      Text(
+        desc,
+        textAlign: TextAlign.center,
+        style: const TextStyle(fontSize: 12, color: Color(0xFF9A9A9A)),
+      ),
+      const SizedBox(height: 24),
+      // 현장 등록 후 다시 확인 (탭 화면은 자동으로 안 바뀌어서)
+      GestureDetector(
+        onTap: _load,
+        child: Container(
+          width: double.infinity,
+          padding: const EdgeInsets.symmetric(vertical: 15),
+          decoration: BoxDecoration(
+            color: const Color(0xFFEDEDED),
+            borderRadius: BorderRadius.circular(12),
+          ),
+          child: const Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(Icons.refresh, size: 16, color: Color(0xFF4A4A4A)),
+              SizedBox(width: 4),
+              Text(
+                '다시 확인',
+                style: TextStyle(
+                  fontSize: 14,
+                  fontWeight: FontWeight.w600,
+                  color: Color(0xFF4A4A4A),
+                ),
+              ),
+            ],
           ),
         ),
       ),

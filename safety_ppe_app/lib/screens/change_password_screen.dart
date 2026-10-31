@@ -49,7 +49,7 @@ class _ChangePasswordScreenState extends State<ChangePasswordScreen> {
         _snack('변경 실패: 현재 비밀번호를 확인해주세요');
       }
     } catch (e) {
-      _snack('서버 연결 실패: $e');
+      _snack(ApiService.connectionErrorText);
     } finally {
       setState(() => loading = false);
     }

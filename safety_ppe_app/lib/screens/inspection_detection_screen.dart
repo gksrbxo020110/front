@@ -15,6 +15,7 @@ import 'api_service.dart';
 // Inspection 실시간 감지 설정값
 const int inspDetectIntervalMs = 1000; // 감지 간격(ms)
 const int inspResultShowMs = 1500; // 완료 표시 후 돌아가기까지(ms)
+const int inspTimeoutSeconds = 30; // 점검 제한 시간(초) → 지나면 자동 판정
 
 // 진행 단계
 enum _InspPhase {
@@ -22,6 +23,7 @@ enum _InspPhase {
   saving, // 저장 중
   saved, // 완료 (착용 완료 = 저장 없이 완료 / 미착용 = 저장 완료)
   saveFailed, // 저장 실패
+  noDetect, // 제한 시간 동안 아무것도 인식 못 함 (판정 불가)
 }
 
 class InspectionDetectionScreen extends StatefulWidget {
@@ -99,6 +101,11 @@ class _InspectionDetectionScreenState extends State<InspectionDetectionScreen> {
   bool _weakPending = false; // 아직 인정 안 된 장비가 노랑으로 보임
   bool _gloveOneSide = false; // 장갑이 한쪽만 계속 보임
 
+  // 제한 시간 (카메라 준비되면 시작)
+  Timer? _timer;
+  int _remain = inspTimeoutSeconds;
+  bool _autoJudged = false; // 시간 초과로 자동 판정됐는지 (문구용)
+
   @override
   void initState() {
     super.initState();
@@ -116,8 +123,59 @@ class _InspectionDetectionScreenState extends State<InspectionDetectionScreen> {
     await _initCamera();
     if (mounted && _controller != null) {
       _startStream();
+      _startTimer();
     }
   }
+
+  // ── 제한 시간 타이머 ──
+  void _startTimer() {
+    _timer?.cancel();
+    _remain = inspTimeoutSeconds;
+    _timer = Timer.periodic(const Duration(seconds: 1), (t) {
+      if (!mounted || _disposed || _phase != _InspPhase.scanning) {
+        t.cancel();
+        return;
+      }
+      setState(() => _remain--);
+      if (_remain <= 0) {
+        t.cancel();
+        _onTimeout();
+      }
+    });
+  }
+
+  void _stopTimer() {
+    _timer?.cancel();
+    _timer = null;
+  }
+
+  // ── 시간 초과 → 지금까지 인정된 장비로 자동 판정 ──
+  Future<void> _onTimeout() async {
+    if (_phase != _InspPhase.scanning) return;
+    _autoJudged = true;
+    await _stopStream();
+    if (!mounted) return;
+
+    final bool allWorn = _result?.allWorn ?? false;
+
+    // ① 착용 완료 → 저장 없이 완료
+    if (allWorn) {
+      _savedAllWorn = true;
+      setState(() => _phase = _InspPhase.saved);
+      Future.delayed(const Duration(milliseconds: inspResultShowMs), _goBack);
+      return;
+    }
+
+    // ② 끝까지 아무것도 인식 못 함 → 사람이 안 찍힌 것일 수 있어서 기록 안 함
+    if (!_filter.hasAnyStrong || _lastImage == null) {
+      setState(() => _phase = _InspPhase.noDetect);
+      return;
+    }
+
+    // ③ 미착용 → 자동 저장
+    _save();
+  }
+
 
   Future<void> _loadSiteId() async {
     try {
@@ -168,6 +226,7 @@ class _InspectionDetectionScreenState extends State<InspectionDetectionScreen> {
   @override
   void dispose() {
     _disposed = true;
+    _stopTimer();
     final c = _controller;
     _controller = null;
     if (c != null) {
@@ -219,9 +278,11 @@ class _InspectionDetectionScreenState extends State<InspectionDetectionScreen> {
       _dupLabel = null;
       _weakPending = false;
       _gloveOneSide = false;
+      _autoJudged = false;
       _result = PpeRules.evaluate(widget.workType, <String>{});
     });
     await _startStream();
+    _startTimer();
   }
 
   // ── 카메라 프레임 도착 ──
@@ -317,6 +378,7 @@ class _InspectionDetectionScreenState extends State<InspectionDetectionScreen> {
     // ① 착용 완료 → 저장하지 않고 완료 표시 후 돌아가기
     //    (서버는 detection_records에 위반만 저장한다고 가정: "오늘 미착용 건수" 등)
     if (allWorn) {
+      _stopTimer();
       await _stopStream();
       if (!mounted) return;
       _savedAllWorn = true;
@@ -337,6 +399,7 @@ class _InspectionDetectionScreenState extends State<InspectionDetectionScreen> {
     }
 
     // ③ 미착용 → 저장
+    _stopTimer();
     await _stopStream();
     _save();
   }
@@ -354,7 +417,7 @@ class _InspectionDetectionScreenState extends State<InspectionDetectionScreen> {
       // 박스(초록+노랑, 작업별 필수만) 그린 사진 (iOS와 동일, 라벨 겹침 방지 포함)
       final bytes = await compute(
         drawBoxesAndEncode,
-        BurnData.fromDetections(_lastImage!, _lastShown),
+        await BurnData.fromDetectionsKo(_lastImage!, _lastShown), // 한글 라벨
       );
 
       final urlRes = await ApiService.getS3UploadUrl();
@@ -605,13 +668,21 @@ class _InspectionDetectionScreenState extends State<InspectionDetectionScreen> {
             : const Color(0xFFE24B4A);
         icon = _savedAllWorn ? Icons.check_circle : Icons.warning_amber_rounded;
         title = _savedAllWorn ? '점검 완료 · 이상 없음' : '점검 완료 · 미착용 기록됨';
-        sub = widget.worker;
+        sub = _autoJudged
+            ? '제한 시간 종료 · 자동 판정 (${widget.worker})'
+            : widget.worker;
         break;
       case _InspPhase.saveFailed:
         color = const Color(0xFFE24B4A);
         icon = Icons.error_outline;
         title = '저장 실패';
         sub = '서버 연결을 확인하세요';
+        break;
+      case _InspPhase.noDetect:
+        color = const Color(0xFFBA7517);
+        icon = Icons.timer_off_outlined;
+        title = '시간 초과 · 인식 실패';
+        sub = '보호구가 인식되지 않아 판정할 수 없어요 · 다시 점검해주세요';
         break;
     }
 
@@ -651,6 +722,24 @@ class _InspectionDetectionScreenState extends State<InspectionDetectionScreen> {
               ],
             ),
           ),
+          // 남은 시간 (점검 중에만)
+          if (_phase == _InspPhase.scanning && _timer != null)
+            Container(
+              margin: const EdgeInsets.only(left: 8),
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+              decoration: BoxDecoration(
+                color: Colors.black.withOpacity(0.2),
+                borderRadius: BorderRadius.circular(20),
+              ),
+              child: Text(
+                '${_remain}s',
+                style: const TextStyle(
+                  fontSize: 14,
+                  fontWeight: FontWeight.w700,
+                  color: Colors.white,
+                ),
+              ),
+            ),
         ],
       ),
     );
@@ -716,6 +805,28 @@ class _InspectionDetectionScreenState extends State<InspectionDetectionScreen> {
           Colors.white,
           const Color(0xFF1A1A1A),
           _goBack,
+        );
+      case _InspPhase.noDetect:
+        return Row(
+          children: [
+            Expanded(
+              child: _boxButton(
+                '돌아가기',
+                const Color(0xFF3A3A3A),
+                Colors.white,
+                _goBack,
+              ),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: _boxButton(
+                '다시 점검',
+                const Color(0xFFBA7517),
+                Colors.white,
+                _restart,
+              ),
+            ),
+          ],
         );
       case _InspPhase.saveFailed:
         return Row(

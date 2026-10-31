@@ -1,8 +1,11 @@
 import 'dart:math';
 import 'dart:typed_data';
+import 'dart:ui' as ui;
+import 'package:flutter/material.dart';
 import 'package:camera/camera.dart';
 import 'package:image/image.dart' as img;
 import 'ppe_detector.dart';
+import 'ppe_labels.dart';
 import 'ppe_realtime_filter.dart';
 
 // ─────────────────────────────────────────────
@@ -142,9 +145,27 @@ img.Image convertYuvToImage(FrameData f) {
 }
 
 // ─────────────────────────────────────────────
-// 저장용: 사진에 박스 + 영어 라벨 그려서 JPG로 (iOS와 동일)
+// 저장용: 사진에 박스 + 한글 라벨 그려서 JPG로
 // 초록(60% 이상) / 노랑(40~59%), 라벨은 이름만 (% 없음)
+//
+// 한글 라벨 방식 (A안):
+//   image 패키지 기본 글꼴(arial14)엔 한글이 없어서,
+//   ① 화면 쪽(메인)에서 Flutter로 한글 글자만 작은 그림으로 만들고 (가벼움)
+//   ② 백그라운드(compute)에서 박스·라벨 자리 계산 + 글자 그림 합성 + JPG 변환 (무거운 일)
+//   → 감지 화면과 같은 폰 기본 한글 글꼴로 나옴
 // ─────────────────────────────────────────────
+
+// 저장 사진 라벨 글자 크기(px)
+const double _burnFontSize = 14;
+
+// 글자 그림 (다른 isolate로 넘기기 위해 숫자·바이트만)
+class TextBitmap {
+  final int width;
+  final int height;
+  final Uint8List alpha; // 글자 모양(투명도)만, 1픽셀 = 1바이트
+  TextBitmap(this.width, this.height, this.alpha);
+}
+
 class BurnBox {
   final String label;
   final double conf;
@@ -152,7 +173,16 @@ class BurnBox {
   final int y1;
   final int x2;
   final int y2;
-  BurnBox(this.label, this.conf, this.x1, this.y1, this.x2, this.y2);
+  final TextBitmap? text; // 한글 라벨 글자 그림 (없으면 영어로 그림)
+  BurnBox(
+    this.label,
+    this.conf,
+    this.x1,
+    this.y1,
+    this.x2,
+    this.y2, [
+    this.text,
+  ]);
 }
 
 class BurnData {
@@ -160,7 +190,7 @@ class BurnData {
   final List<BurnBox> boxes;
   BurnData(this.image, this.boxes);
 
-  // 감지 결과로 BurnData 만들기 (40% 미만은 제외)
+  // 감지 결과로 BurnData 만들기 (40% 미만은 제외, 영어 라벨)
   static BurnData fromDetections(img.Image image, List<Detection> dets) {
     return BurnData(
       image,
@@ -178,6 +208,108 @@ class BurnData {
           )
           .toList(),
     );
+  }
+
+  // 한글 라벨 버전 (게이트·Inspection 저장에서 사용)
+  // 화면 쪽에서 실행해야 함 (Flutter 글자 그리기) → 그 뒤 compute로 넘김
+  static Future<BurnData> fromDetectionsKo(
+    img.Image image,
+    List<Detection> dets,
+  ) async {
+    final Map<String, TextBitmap> cache = {}; // 같은 라벨은 한 번만 그림
+    final List<BurnBox> boxes = [];
+    for (final d in dets.where(PpeRealtimeFilter.isVisible)) {
+      final String name = ppeLabelsKo[d.label] ?? d.label;
+      TextBitmap? tb = cache[name];
+      if (tb == null) {
+        try {
+          tb = await _renderText(name);
+          cache[name] = tb;
+        } catch (e) {
+          debugPrint('라벨 글자 그리기 실패 → 영어로: $e');
+        }
+      }
+      boxes.add(
+        BurnBox(
+          d.label,
+          d.confidence,
+          d.left.round(),
+          d.top.round(),
+          (d.left + d.width).round(),
+          (d.top + d.height).round(),
+          tb,
+        ),
+      );
+    }
+    return BurnData(image, boxes);
+  }
+}
+
+// 한글 글자 → 투명도 그림 (Flutter로 그림, 폰 기본 한글 글꼴)
+Future<TextBitmap> _renderText(String text) async {
+  final tp = TextPainter(
+    text: TextSpan(
+      text: text,
+      style: const TextStyle(
+        fontSize: _burnFontSize,
+        fontWeight: FontWeight.w600,
+        color: Colors.white, // 모양만 쓰고 색은 합성할 때 정함
+      ),
+    ),
+    textDirection: TextDirection.ltr,
+    maxLines: 1,
+  )..layout();
+
+  final int w = max(1, tp.width.ceil());
+  final int h = max(1, tp.height.ceil());
+  final recorder = ui.PictureRecorder();
+  final canvas = Canvas(recorder);
+  tp.paint(canvas, Offset.zero);
+  final picture = recorder.endRecording();
+  final image = await picture.toImage(w, h);
+  final data = await image.toByteData(format: ui.ImageByteFormat.rawRgba);
+  image.dispose();
+  picture.dispose();
+  if (data == null) throw Exception('글자 그림 변환 실패');
+
+  final Uint8List rgba = data.buffer.asUint8List();
+  final Uint8List alpha = Uint8List(w * h);
+  for (int i = 0; i < w * h; i++) {
+    alpha[i] = rgba[i * 4 + 3];
+  }
+  return TextBitmap(w, h, alpha);
+}
+
+// 글자 그림을 사진에 합성 (백그라운드에서 실행)
+void _blendText(
+  img.Image out,
+  TextBitmap t,
+  int x0,
+  int y0,
+  int cr,
+  int cg,
+  int cb,
+) {
+  final int w = out.width;
+  final int h = out.height;
+  for (int y = 0; y < t.height; y++) {
+    final int py = y0 + y;
+    if (py < 0 || py >= h) continue;
+    for (int x = 0; x < t.width; x++) {
+      final int a = t.alpha[y * t.width + x];
+      if (a == 0) continue;
+      final int px = x0 + x;
+      if (px < 0 || px >= w) continue;
+      final p = out.getPixel(px, py);
+      final int ia = 255 - a;
+      out.setPixelRgb(
+        px,
+        py,
+        (p.r.toInt() * ia + cr * a) ~/ 255,
+        (p.g.toInt() * ia + cg * a) ~/ 255,
+        (p.b.toInt() * ia + cb * a) ~/ 255,
+      );
+    }
   }
 }
 
@@ -203,7 +335,7 @@ class _LabelRect {
   }
 }
 
-// 저장 사진 라벨·박스 설정 (arial14 기준)
+// 저장 사진 라벨·박스 설정 (영어 arial14 기준, 한글은 글자 그림 크기로 계산)
 const int _burnCharW = 8; // 글자 1개 대략 폭(px)
 const int _burnPadW = 6; // 라벨 좌우 여백 합(px)
 const int _burnLabelH = 18; // 라벨 높이(px) — 실제 글자 높이에 맞춤 (라벨끼리 겹침 방지)
@@ -321,9 +453,12 @@ Uint8List drawBoxesAndEncode(BurnData d) {
   for (final b in boxes) {
     final bool strong = b.conf >= PpeRealtimeFilter.minConfidence;
     final color = strong ? green : yellow;
-    final text = b.label; // 이름만 (% 없음)
-    final int lw = text.length * _burnCharW + _burnPadW;
-    const int lh = _burnLabelH;
+    final text = b.label; // 영어 이름 (한글 글자 그림 없을 때만 사용)
+    final TextBitmap? tb = b.text;
+    final int lw = tb != null
+        ? tb.width + _burnPadW
+        : text.length * _burnCharW + _burnPadW;
+    final int lh = tb != null ? max(_burnLabelH, tb.height + 4) : _burnLabelH;
     final bool leftSide = (b.x1 + b.x2) / 2 < bodyCx;
     final ownBox = _LabelRect(b.x1, b.y1, b.x2, b.y2);
 
@@ -398,14 +533,27 @@ Uint8List drawBoxesAndEncode(BurnData d) {
       y2: min(h - 1, r.y2),
       color: color,
     );
-    img.drawString(
-      out,
-      text,
-      font: img.arial14,
-      x: r.x1 + 3,
-      y: r.y1 + 2,
-      color: strong ? white : dark,
-    );
+    if (tb != null) {
+      // 한글 라벨 (초록 위 흰 글자 / 노랑 위 검은 글자)
+      _blendText(
+        out,
+        tb,
+        r.x1 + 3,
+        r.y1 + ((r.y2 - r.y1) - tb.height) ~/ 2,
+        strong ? 255 : 26,
+        strong ? 255 : 26,
+        strong ? 255 : 26,
+      );
+    } else {
+      img.drawString(
+        out,
+        text,
+        font: img.arial14,
+        x: r.x1 + 3,
+        y: r.y1 + 2,
+        color: strong ? white : dark,
+      );
+    }
   }
 
   return img.encodeJpg(out, quality: 85);

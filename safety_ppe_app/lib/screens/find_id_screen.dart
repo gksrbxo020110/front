@@ -37,7 +37,7 @@ class _FindIdScreenState extends State<FindIdScreen> {
         _snack('가입된 아이디를 찾을 수 없습니다');
       }
     } catch (e) {
-      _snack('서버 연결 실패: $e');
+      _snack(ApiService.connectionErrorText);
     } finally {
       setState(() => loading = false);
     }

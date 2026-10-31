@@ -7,6 +7,37 @@ class ApiService {
   // 팀장 서버 주소 → server_config.dart에서 가져옴 (깃허브 공개용으로 분리)
   static const String baseUrl = serverBaseUrl;
 
+  // ══════════════════ 에러 문구 ══════════════════
+
+  // 서버 연결 자체가 안 될 때 (예외 내용은 화면에 안 보여줌)
+  static const String connectionErrorText = '서버에 연결할 수 없어요 · 인터넷 연결을 확인해주세요';
+
+  // 서버 실패 응답 → 화면에 보여줄 한 줄 문구
+  //   {"message":"이미 사용 중인 이메일입니다."} → 이미 사용 중인 이메일입니다.
+  //   한글 문구가 없거나(영어 에러·HTML 등) 너무 길면 → fallback
+  static String errorText(
+    dynamic body, {
+    String fallback = '요청에 실패했어요 · 잠시 후 다시 시도해주세요',
+  }) {
+    String s = body?.toString().trim() ?? '';
+    if (s.isEmpty) return fallback;
+    try {
+      final data = jsonDecode(s);
+      if (data is Map) {
+        s = data['message']?.toString().trim() ?? '';
+      } else if (data is String) {
+        s = data.trim();
+      }
+    } catch (_) {
+      // JSON 아님 → 그냥 글자로 봄
+    }
+    final bool hasKorean = RegExp(r'[가-힣]').hasMatch(s);
+    if (s.isEmpty || !hasKorean || s.length > 80 || s.startsWith('<')) {
+      return fallback;
+    }
+    return s;
+  }
+
   // ══════════════════ 인증 ══════════════════
 
   // ── 이메일 인증코드 발송 ──

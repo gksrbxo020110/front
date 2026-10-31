@@ -30,6 +30,14 @@ class PpeDetector {
   static const double defaultThreshold = 0.30;
   static const double iouThreshold = 0.45; // NMS 겹침 기준
 
+  // 서로 헷갈리는 장비 묶음: 같은 자리에서 겹치면 신뢰도 높은 것 하나만 남김
+  // (예: 안전모 + 안전모(턱끈X)가 한 머리에 같이 뜨는 경우)
+  static const List<Set<String>> confusableGroups = [
+    {'helmet', 'helmet_nostrap'},
+    {'gaiters', 'welding_gaiters'},
+  ];
+  static const double confusableOverlap = 0.5; // 작은 박스 기준 겹침 비율
+
   // ★ 속도 설정
   static const int numThreads = 4; // TFLite가 쓰는 CPU 개수 (기본 1 → 4)
   static const bool printDetections = false; // 프레임마다 감지 목록 출력 (확인용)
@@ -200,7 +208,9 @@ class PpeDetector {
     }
 
     // 5. NMS (겹치는 박스 제거)
-    final List<_Candidate> kept = _nms(candidates, iouThreshold);
+    final List<_Candidate> kept = _suppressConfusable(
+      _nms(candidates, iouThreshold),
+    );
 
     // 6. 좌표를 원본 이미지 픽셀로 역변환 (레터박싱 되돌리기)
     final List<Detection> results = [];
@@ -260,6 +270,41 @@ class PpeDetector {
       }
     }
     return kept;
+  }
+
+  // 헷갈리는 장비끼리 겹치면 신뢰도 높은 것만 남김 (점수 높은 순으로 들어옴)
+  // 겹침 = 교집합 / 작은 박스 넓이 (한 박스가 다른 박스 안에 들어가도 잡힘)
+  List<_Candidate> _suppressConfusable(List<_Candidate> cands) {
+    final List<_Candidate> sorted = List.of(cands)
+      ..sort((a, b) => b.score.compareTo(a.score));
+    final List<_Candidate> kept = [];
+    for (final c in sorted) {
+      bool drop = false;
+      for (final k in kept) {
+        if (k.label == c.label) continue; // 같은 장비는 NMS에서 처리됨
+        final bool sameGroup = confusableGroups.any(
+          (g) => g.contains(k.label) && g.contains(c.label),
+        );
+        if (sameGroup && _overlapSmall(k, c) > confusableOverlap) {
+          drop = true; // k가 점수 더 높음 → c 버림
+          break;
+        }
+      }
+      if (!drop) kept.add(c);
+    }
+    return kept;
+  }
+
+  // 교집합 / 작은 박스 넓이
+  double _overlapSmall(_Candidate a, _Candidate b) {
+    final double ix1 = max(a.cx - a.w / 2, b.cx - b.w / 2);
+    final double iy1 = max(a.cy - a.h / 2, b.cy - b.h / 2);
+    final double ix2 = min(a.cx + a.w / 2, b.cx + b.w / 2);
+    final double iy2 = min(a.cy + a.h / 2, b.cy + b.h / 2);
+    final double inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1);
+    final double smaller = min(a.w * a.h, b.w * b.h);
+    if (smaller <= 0) return 0;
+    return inter / smaller;
   }
 
   // IoU (두 박스 겹침 비율)

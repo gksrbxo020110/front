@@ -387,7 +387,12 @@ class _SiteManageScreenState extends State<SiteManageScreen> {
       } else {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text('해제 실패: ${result['body']}'),
+            content: Text(
+              ApiService.errorText(
+                result['body'],
+                fallback: '소속 해제에 실패했어요 · 다시 시도해주세요',
+              ),
+            ),
             duration: const Duration(seconds: 2),
           ),
         );
@@ -395,7 +400,7 @@ class _SiteManageScreenState extends State<SiteManageScreen> {
     } catch (e) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text('서버 연결 실패: $e'),
+          content: const Text(ApiService.connectionErrorText),
           duration: const Duration(seconds: 2),
         ),
       );
@@ -828,7 +833,12 @@ class _SiteCreateScreenState extends State<SiteCreateScreen> {
       } else {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text('현장 생성 실패: ${result['body']}'),
+            content: Text(
+              ApiService.errorText(
+                result['body'],
+                fallback: '현장 생성에 실패했어요 · 다시 시도해주세요',
+              ),
+            ),
             duration: const Duration(seconds: 2),
           ),
         );
@@ -837,7 +847,7 @@ class _SiteCreateScreenState extends State<SiteCreateScreen> {
     } catch (e) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text('서버 연결 실패: $e'),
+          content: const Text(ApiService.connectionErrorText),
           duration: const Duration(seconds: 2),
         ),
       );

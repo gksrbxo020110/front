@@ -13,6 +13,7 @@ class ManagerHomeScreen extends StatefulWidget {
 
 class _ManagerHomeScreenState extends State<ManagerHomeScreen> {
   bool loading = true;
+  dynamic siteId; // 소속 현장 id (없으면 null)
   String siteName = '';
   int greenCount = 0;
   int yellowCount = 0;
@@ -31,6 +32,7 @@ class _ManagerHomeScreenState extends State<ManagerHomeScreen> {
     if (!mounted) return;
     if (result['success'] == true) {
       setState(() {
+        siteId = result['siteId'];
         siteName = result['siteName']?.toString() ?? '';
         greenCount = result['greenCount'] ?? 0;
         yellowCount = result['yellowCount'] ?? 0;
@@ -38,8 +40,44 @@ class _ManagerHomeScreenState extends State<ManagerHomeScreen> {
         loading = false;
       });
     } else {
-      setState(() => loading = false);
+      // 대시보드 실패(현장 없음 등) → 내 정보로 소속 현장 한 번 더 확인
+      dynamic id;
+      String name = '';
+      try {
+        final info = await ApiService.getMyInfo();
+        if (info['success'] == true) {
+          id = info['siteId'];
+          name = info['siteName']?.toString() ?? '';
+        }
+      } catch (_) {}
+      if (!mounted) return;
+      setState(() {
+        siteId = id;
+        siteName = name;
+        greenCount = 0;
+        yellowCount = 0;
+        redCount = 0;
+        loading = false;
+      });
     }
+  }
+
+  // 소속 현장이 있는지 (현장 없으면 Gate·Inspection 막음)
+  bool get _hasSite => siteId != null || siteName.isNotEmpty;
+
+  // Gate·Inspection 진입 (현장 없으면 안내만)
+  void _openMode(Widget screen) {
+    if (loading) return; // 아직 현장 정보 불러오는 중
+    if (!_hasSite) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('소속 현장이 없어요 · 현장 관리에서 현장을 먼저 생성해주세요'),
+          duration: Duration(seconds: 2),
+        ),
+      );
+      return;
+    }
+    _openAndRefresh(screen);
   }
 
   // 다른 화면 갔다가 돌아오면 숫자 새로고침
@@ -168,26 +206,35 @@ class _ManagerHomeScreenState extends State<ManagerHomeScreen> {
 
                 // ── Gate 카드 (9번 연결) ──
                 GestureDetector(
-                  onTap: () => _openAndRefresh(const GateQrScreen()),
-                  child: const _ModeCard(
+                  onTap: () => _openMode(const GateQrScreen()),
+                  child: _ModeCard(
                     icon: Icons.qr_code_scanner,
                     title: 'Gate 모드',
                     subtitle: 'QR 스캔 · 무인 입장 체크',
                     filled: true,
+                    disabled: !loading && !_hasSite,
                   ),
                 ),
                 const SizedBox(height: 10),
 
                 // ── Inspection 카드 (11번 연결) ──
                 GestureDetector(
-                  onTap: () => _openAndRefresh(const InspectionWorkScreen()),
-                  child: const _ModeCard(
+                  onTap: () => _openMode(const InspectionWorkScreen()),
+                  child: _ModeCard(
                     icon: Icons.assignment_turned_in_outlined,
                     title: 'Inspection 모드',
                     subtitle: '관리자 순찰 점검자',
                     filled: false,
+                    disabled: !loading && !_hasSite,
                   ),
                 ),
+                if (!loading && !_hasSite) ...[
+                  const SizedBox(height: 8),
+                  const Text(
+                    '소속 현장이 없으면 Gate·Inspection 모드를 사용할 수 없어요',
+                    style: TextStyle(fontSize: 11, color: Color(0xFFE24B4A)),
+                  ),
+                ],
                 const SizedBox(height: 22),
 
                 // ── 현장 관리 버튼 ──
@@ -258,11 +305,13 @@ class _ModeCard extends StatelessWidget {
   final String title;
   final String subtitle;
   final bool filled;
+  final bool disabled; // 현장 없음 → 흐리게
   const _ModeCard({
     required this.icon,
     required this.title,
     required this.subtitle,
     required this.filled,
+    this.disabled = false,
   });
 
   @override
@@ -273,7 +322,9 @@ class _ModeCard extends StatelessWidget {
         ? const Color(0xFFB8B8B8)
         : const Color(0xFF9A9A9A);
 
-    return Container(
+    return Opacity(
+      opacity: disabled ? 0.35 : 1.0,
+      child: Container(
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
         color: bg,
@@ -307,6 +358,7 @@ class _ModeCard extends StatelessWidget {
             color: filled ? const Color(0xFF6B6B6B) : const Color(0xFFC4C4C4),
           ),
         ],
+      ),
       ),
     );
   }
