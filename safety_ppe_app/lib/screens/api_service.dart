@@ -92,6 +92,23 @@ class ApiService {
     };
   }
 
+  // ── 지금 로그인한 계정 비밀번호 확인 (Gate 관리자 확인·나가기 잠금용) ──
+  // 서버 로그인 API로 확인만 하고, 저장된 토큰은 건드리지 않음
+  // true = 맞음 / false = 틀림 / null = 서버 연결 실패
+  static Future<bool?> verifyMyPassword(String password) async {
+    try {
+      final userId = await getUserId();
+      if (userId == null || userId.isEmpty) return false;
+      final res = await login(userId, password);
+      if (res['success'] == true) return true;
+      final code = res['statusCode'];
+      if (code is int && code >= 500) return null;
+      return false;
+    } catch (_) {
+      return null;
+    }
+  }
+
   // ── 로그인 ──
   static Future<Map<String, dynamic>> login(
     String userId,

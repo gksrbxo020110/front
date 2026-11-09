@@ -2,6 +2,8 @@ import 'package:flutter/material.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
 import 'gate_detection_screen.dart';
 import 'api_service.dart';
+import 'fcm_service.dart';
+import 'admin_password_dialog.dart';
 
 class GateQrScreen extends StatefulWidget {
   const GateQrScreen({super.key});
@@ -36,13 +38,33 @@ class _GateQrScreenState extends State<GateQrScreen> {
   @override
   void initState() {
     super.initState();
+    FcmService.gateModeActive = true; // Gate 모드 중 알림 탭 이동 막기
     _loadMySiteId(); // 화면 열릴 때 한 번만
   }
 
   @override
   void dispose() {
+    FcmService.gateModeActive = false;
     _scanner.dispose();
     super.dispose();
+  }
+
+  // ── Gate 모드 나가기 (관리자 비밀번호 확인) ──
+  // 게이트 폰은 관리자 계정이라, 작업자가 나가서 관리자 앱을 조작하지 못하게 잠금
+  bool _exiting = false;
+  Future<void> _tryExit() async {
+    if (_exiting) return;
+    _exiting = true;
+    final ok = await showAdminPasswordDialog(
+      context,
+      title: 'Gate 모드 나가기',
+      message: '나가려면 관리자 비밀번호를 입력하세요',
+    );
+    _exiting = false;
+    if (ok && mounted) {
+      FcmService.gateModeActive = false;
+      Navigator.pop(context);
+    }
   }
 
   // 관리자 현장 번호 불러오기 (실패하면 null 유지)
@@ -215,7 +237,13 @@ class _GateQrScreenState extends State<GateQrScreen> {
         ? (_failName.isNotEmpty ? '출입 제한 · $_failName' : '출입 제한')
         : 'QR 인증 실패';
 
-    return Scaffold(
+    // 폰의 뒤로가기도 막고 비밀번호 확인
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, result) {
+        if (!didPop) _tryExit();
+      },
+      child: Scaffold(
       backgroundColor: const Color(0xFF1A1A1A),
       body: SafeArea(
         child: Column(
@@ -226,7 +254,7 @@ class _GateQrScreenState extends State<GateQrScreen> {
               child: Row(
                 children: [
                   GestureDetector(
-                    onTap: () => Navigator.pop(context),
+                    onTap: _tryExit, // 관리자 비밀번호 확인 후 나가기
                     child: const Icon(
                       Icons.arrow_back,
                       color: Colors.white,
@@ -397,6 +425,7 @@ class _GateQrScreenState extends State<GateQrScreen> {
             const SizedBox(height: 20),
           ],
         ),
+      ),
       ),
     );
   }

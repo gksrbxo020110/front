@@ -24,6 +24,10 @@ class FcmService {
   // 이번 실행에서 로그인했는지 (로그인 성공 시 true)
   static bool _loggedInThisSession = false;
 
+  // Gate 모드 중이면 알림을 눌러도 다른 화면으로 이동하지 않음
+  // (게이트 폰은 관리자 계정 → 알림 탭으로 나가기 잠금을 우회하는 것 방지)
+  static bool gateModeActive = false;
+
   // 로그인 전에 알림을 눌렀으면 true → 로그인 후 알림 탭으로 이동
   static bool _pendingOpenNotifications = false;
 
@@ -117,6 +121,10 @@ class FcmService {
 
   // ── 알림 탭 처리: 역할에 맞는 알림 탭으로 이동 ──
   static Future<void> _onNotificationTapped() async {
+    if (gateModeActive) {
+      print('🔔 Gate 모드 중 → 알림 탭 이동 안 함');
+      return;
+    }
     final token = await ApiService.getToken();
     final role = await ApiService.getRole();
     final nav = navigatorKey.currentState;

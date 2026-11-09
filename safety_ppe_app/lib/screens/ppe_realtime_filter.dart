@@ -9,7 +9,7 @@ import 'ppe_detector.dart';
 //   - 40~59% = 노랑 (애매함 → 재인식 유도, 착용 인정 안 함)
 //   - 40% 미만 = 무시 (화면에도 안 보임)
 // 착용 인정: 초록이 서로 다른 프레임에서 minHits번 이상
-// 장갑: 감지 중 한 번이라도 2개가 같이 보여야 인정 (한쪽만 끼면 미착용)
+// 짝 장비(장갑·안전화·각반): 감지 중 한 번이라도 2개가 같이 보여야 인정 (한쪽만이면 미착용)
 // 중복: 1개짜리 장비(안전모 등)가 2개 → 여러 명 의심, 그 프레임은 판정에서 제외
 // ─────────────────────────────────────────────
 class PpeRealtimeFilter {
@@ -19,11 +19,25 @@ class PpeRealtimeFilter {
   static const int minHits = 2; // 몇 프레임에서 초록으로 잡혀야 인정할지
   static const double dupMaxIou = 0.3; // 이 이상 겹치면 같은 물건으로 봄 (개수 셀 때)
 
-  // 양쪽에 하나씩 있어야 하는 장비 (2개가 같이 보여야 인정) — 팀 결정: 장갑만
+  // 양쪽에 하나씩 있어야 하는 장비 (2개가 같이 보여야 인정)
+  // 팀 결정(11/9): 장갑 3종 + 안전화 + 각반 2종
   static const Set<String> pairLabels = {
-    'safety_gloves',
-    'chemical_gloves',
-    'welding_gloves',
+    'safety_gloves', // 양손
+    'chemical_gloves', // 양손
+    'welding_gloves', // 양손
+    'safety_shoes', // 양발
+    'gaiters', // 양다리
+    'welding_gaiters', // 양다리
+  };
+
+  // 짝 장비 한쪽만일 때 안내 문구
+  static const Map<String, String> pairMissingText = {
+    'safety_gloves': '⚠ 장갑을 양손에 모두 착용하세요',
+    'chemical_gloves': '⚠ 내화학장갑을 양손에 모두 착용하세요',
+    'welding_gloves': '⚠ 용접장갑을 양손에 모두 착용하세요',
+    'safety_shoes': '⚠ 안전화를 양발에 모두 착용하세요 · 두 발이 보이게 해주세요',
+    'gaiters': '⚠ 각반을 양다리에 모두 착용하세요 · 두 다리가 보이게 해주세요',
+    'welding_gaiters': '⚠ 용접각반을 양다리에 모두 착용하세요 · 두 다리가 보이게 해주세요',
   };
 
   // 한 사람에게 1개뿐인 장비 → 2개 이상이면 여러 명 의심
@@ -48,11 +62,20 @@ class PpeRealtimeFilter {
   // 라벨별 최고 신뢰도 감지 (저장할 때 items로 보냄)
   final Map<String, Detection> _best = {};
 
+  // 라벨별 노랑(40~59%) 감지가 나온 프레임 수 → 시간 종료 시 "애매" 판단
+  final Map<String, int> _weakHits = {};
+
+  // 짝 장비: 한 프레임에 초록 1개 이상 + 다른 위치에 노랑까지 합쳐 2개 이상 보인 프레임 수
+  // (한쪽은 초록, 다른 쪽은 흐리게 보임 → 한쪽만 착용이 아니라 "애매")
+  final Map<String, int> _pairWeakHits = {};
+
   // 새 사람 감지 시작할 때 초기화
   void reset() {
     _hits.clear();
     _pairHits.clear();
     _best.clear();
+    _weakHits.clear();
+    _pairWeakHits.clear();
   }
 
   // 초록 (60% 이상)
@@ -74,12 +97,30 @@ class PpeRealtimeFilter {
     for (final label in labelsThisFrame) {
       _hits[label] = (_hits[label] ?? 0) + 1;
 
-      // 장갑: 이번 프레임에 2개(서로 다른 위치)가 같이 잡혔는지
+      // 짝 장비: 이번 프레임에 2개(서로 다른 위치)가 같이 잡혔는지
       if (pairLabels.contains(label)) {
         final same = strong.where((d) => d.label == label).toList();
         if (distinctCount(same) >= 2) {
           _pairHits[label] = (_pairHits[label] ?? 0) + 1;
         }
+      }
+    }
+
+    // 노랑 기록
+    final weakLabels = detections.where(isWeak).map((d) => d.label).toSet();
+    for (final label in weakLabels) {
+      _weakHits[label] = (_weakHits[label] ?? 0) + 1;
+    }
+
+    // 짝 장비: 초록이 있는데 짝이 아직 안 맞은 프레임에서, 노랑까지 합치면 2개인지
+    for (final label in pairLabels) {
+      final strongSame = strong.where((d) => d.label == label).toList();
+      if (strongSame.isEmpty || distinctCount(strongSame) >= 2) continue;
+      final visibleSame = detections
+          .where((d) => d.label == label && isVisible(d))
+          .toList();
+      if (distinctCount(visibleSame) >= 2) {
+        _pairWeakHits[label] = (_pairWeakHits[label] ?? 0) + 1;
       }
     }
 
@@ -94,7 +135,7 @@ class PpeRealtimeFilter {
 
   // 인정된 라벨 → PpeRules.evaluate에 넣을 값
   //  - minHits번 이상 초록
-  //  - 장갑은 2개가 같이 보인 적이 한 번 이상
+  //  - 짝 장비(장갑·안전화·각반)는 2개가 같이 보인 적이 한 번 이상
   Set<String> get confirmedLabels => _hits.entries
       .where((e) => e.value >= minHits)
       .where((e) => !pairLabels.contains(e.key) || (_pairHits[e.key] ?? 0) >= 1)
@@ -110,6 +151,23 @@ class PpeRealtimeFilter {
   // 초록 감지가 한 번이라도 있었는지 (없으면 "인식률 낮음" → 빈 사진 저장 방지)
   bool get hasAnyStrong => _hits.isNotEmpty;
 
+  // 초록이든 노랑이든 무언가 보인 적이 있는지
+  bool get hasAnyVisible => _hits.isNotEmpty || _weakHits.isNotEmpty;
+
+  // ── 시간 종료 시 "애매"인지 (팀 결정 11/9) ──
+  //  - 인정된 장비 → 애매 아님 (착용)
+  //  - 짝 장비가 한쪽만 초록: 다른 쪽이 노랑으로라도 같이 보였으면 애매, 아니면 미착용(한쪽만 착용)
+  //  - 그 외: 노랑으로 잡힌 적이 있으면 애매, 없으면 미착용
+  bool isUncertain(String label) {
+    if (confirmedLabels.contains(label)) return false;
+    if (pairLabels.contains(label) &&
+        hitsOf(label) >= minHits &&
+        (_pairHits[label] ?? 0) == 0) {
+      return (_pairWeakHits[label] ?? 0) > 0;
+    }
+    return (_weakHits[label] ?? 0) > 0;
+  }
+
   // 특정 라벨이 몇 프레임에서 초록으로 잡혔는지
   int hitsOf(String label) => _hits[label] ?? 0;
 
@@ -119,6 +177,14 @@ class PpeRealtimeFilter {
 
   // 짝 장비 중 하나라도 한쪽만인지
   bool get anyPairMissing => pairLabels.any(pairMissing);
+
+  // 한쪽만 보이는 짝 장비의 안내 문구 (없으면 null)
+  String? get pairMissingMessage {
+    for (final label in pairLabels) {
+      if (pairMissing(label)) return pairMissingText[label];
+    }
+    return null;
+  }
 
   // ── 중복 감지: 1개짜리 장비가 이번 프레임에 2개 이상이면 그 라벨 반환 ──
   static String? duplicateLabel(List<Detection> strong) {

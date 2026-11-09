@@ -11,6 +11,7 @@ import 'ppe_realtime_filter.dart';
 import 'ppe_frame_utils.dart';
 import 'ppe_box_overlay.dart';
 import 'api_service.dart';
+import 'ppe_judge.dart';
 
 // Inspection 실시간 감지 설정값
 const int inspDetectIntervalMs = 1000; // 감지 간격(ms)
@@ -24,6 +25,8 @@ enum _InspPhase {
   saved, // 완료 (착용 완료 = 저장 없이 완료 / 미착용 = 저장 완료)
   saveFailed, // 저장 실패
   noDetect, // 제한 시간 동안 아무것도 인식 못 함 (판정 불가)
+  retakeWait, // 노랑(애매) → 재촬영 안내 ([다시 점검] 누르면 시작)
+  adminDecide, // 재촬영에서도 노랑 → 관리자가 미착용 기록 / 착용 인정 선택
 }
 
 class InspectionDetectionScreen extends StatefulWidget {
@@ -99,12 +102,17 @@ class _InspectionDetectionScreenState extends State<InspectionDetectionScreen> {
   bool _savedAllWorn = false; // 완료 시점 결과 (완료 문구용)
   String? _dupLabel; // 이번 프레임 중복 감지된 장비 (여러 명 의심)
   bool _weakPending = false; // 아직 인정 안 된 장비가 노랑으로 보임
-  bool _gloveOneSide = false; // 장갑이 한쪽만 계속 보임
+  String? _pairMissingMsg; // 짝 장비(장갑·안전화·각반)가 한쪽만 보일 때 안내
 
   // 제한 시간 (카메라 준비되면 시작)
   Timer? _timer;
   int _remain = inspTimeoutSeconds;
   bool _autoJudged = false; // 시간 초과로 자동 판정됐는지 (문구용)
+
+  // 재촬영·관리자 판단 (팀 결정 11/9)
+  int _attempt = 1; // 1 = 첫 점검, 2 = 재촬영
+  JudgeOutcome? _outcome; // 판정 결과 (착용·미착용·애매)
+  List<String> _pendingMissing = []; // 저장할 미착용 라벨 (저장 재시도용)
 
   @override
   void initState() {
@@ -166,14 +174,67 @@ class _InspectionDetectionScreenState extends State<InspectionDetectionScreen> {
       return;
     }
 
-    // ② 끝까지 아무것도 인식 못 함 → 사람이 안 찍힌 것일 수 있어서 기록 안 함
-    if (!_filter.hasAnyStrong || _lastImage == null) {
+    // ② 끝까지 아무것도 안 보임 (초록·노랑 모두 없음) → 사람이 안 찍힌 것일 수 있어서 기록 안 함
+    if (!_filter.hasAnyVisible || _lastImage == null) {
       setState(() => _phase = _InspPhase.noDetect);
       return;
     }
 
-    // ③ 미착용 → 자동 저장
+    // ③ 미착용 / 애매 판정
+    _judgeEnd();
+  }
+
+  // ── 미착용·애매 판정 (시간 종료·점검 완료 공통, 스트림은 이미 멈춘 상태) ──
+  void _judgeEnd() {
+    final o = judgeAtEnd(
+      workType: widget.workType,
+      result: _result!,
+      judgedLabels: _judgedLabels,
+      filter: _filter,
+    );
+    _outcome = o;
+
+    // 애매(노랑) 없음 → 확실한 미착용만 저장
+    if (!o.hasAmbiguous) {
+      _pendingMissing = o.missingLabels;
+      _save();
+      return;
+    }
+    // 첫 점검에서 노랑 → 기록 안 하고 재촬영 안내
+    if (_attempt == 1) {
+      setState(() => _phase = _InspPhase.retakeWait);
+      return;
+    }
+    // 재촬영에서도 노랑 → 관리자 판단
+    setState(() => _phase = _InspPhase.adminDecide);
+  }
+
+  // [다시 점검] (재촬영)
+  Future<void> _beginRetake() async {
+    _attempt = 2;
+    await _restart();
+  }
+
+  // 관리자: 애매한 장비도 미착용으로 기록
+  void _adminRecordMissing() {
+    final o = _outcome;
+    if (o == null) return;
+    _pendingMissing = o.allMissingLabels;
     _save();
+  }
+
+  // 관리자: 애매한 장비는 착용으로 인정 → 안 보인 장비만 미착용, 없으면 이상 없음
+  void _adminAcceptWorn() {
+    final o = _outcome;
+    if (o == null) return;
+    if (o.hasMissing) {
+      _pendingMissing = o.missingLabels;
+      _save();
+    } else {
+      _savedAllWorn = true;
+      setState(() => _phase = _InspPhase.saved);
+      Future.delayed(const Duration(milliseconds: inspResultShowMs), _goBack);
+    }
   }
 
 
@@ -277,7 +338,7 @@ class _InspectionDetectionScreenState extends State<InspectionDetectionScreen> {
       _strapWarning = false;
       _dupLabel = null;
       _weakPending = false;
-      _gloveOneSide = false;
+      _pairMissingMsg = null;
       _autoJudged = false;
       _result = PpeRules.evaluate(widget.workType, <String>{});
     });
@@ -349,7 +410,7 @@ class _InspectionDetectionScreenState extends State<InspectionDetectionScreen> {
         _noDetectHint = strongNow.isEmpty;
         _dupLabel = dup;
         _weakPending = weakPending;
-        _gloveOneSide = _filter.anyPairMissing;
+        _pairMissingMsg = _filter.pairMissingMessage;
       });
     } catch (e) {
       debugPrint('프레임 처리 오류: $e');
@@ -387,8 +448,8 @@ class _InspectionDetectionScreenState extends State<InspectionDetectionScreen> {
       return;
     }
 
-    // ② 미착용인데 초록 감지가 한 번도 없으면 저장 안 함 (빈 사진 저장 방지)
-    if (!_filter.hasAnyStrong || _lastImage == null) {
+    // ② 아무것도 안 보이면 저장 안 함 (빈 사진 저장 방지) → 계속 점검
+    if (!_filter.hasAnyVisible || _lastImage == null) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
           content: Text('인식된 보호구가 없어요 · 작업자 전신을 화면에 비춰주세요'),
@@ -398,10 +459,11 @@ class _InspectionDetectionScreenState extends State<InspectionDetectionScreen> {
       return;
     }
 
-    // ③ 미착용 → 저장
+    // ③ 미착용 / 애매 → 시간 종료와 똑같이 판정
     _stopTimer();
     await _stopStream();
-    _save();
+    if (!mounted) return;
+    _judgeEnd();
   }
 
   // ── 저장 (B안: 미착용일 때만 여기로 옴 — _finish에서 걸러짐) ──
@@ -443,11 +505,8 @@ class _InspectionDetectionScreenState extends State<InspectionDetectionScreen> {
           .where((it) => it['ppeId'] != -1)
           .toList();
 
-      // ② 미착용: 작업별 빠진 필수 항목을 worn=false로 (장갑 한쪽만도 여기로 들어감)
-      for (final label in PpeRules.missingLabels(
-        widget.workType,
-        _judgedLabels,
-      )) {
+      // ② 미착용: 판정·관리자 선택에 따른 미착용 항목을 worn=false로 (짝 장비 한쪽만도 포함)
+      for (final label in _pendingMissing) {
         final id = ppeLabels.indexOf(label);
         if (id == -1) continue;
         items.add(<String, dynamic>{
@@ -640,13 +699,13 @@ class _InspectionDetectionScreenState extends State<InspectionDetectionScreen> {
         } else {
           color = const Color(0xFFE24B4A);
           icon = Icons.search;
-          title = '착용 확인 중';
+          title = _attempt >= 2 ? '재촬영 · 착용 확인 중' : '착용 확인 중';
           if (_strapWarning) {
             sub = '⚠ 안전모 턱끈을 착용하세요';
           } else if (_weakPending) {
             sub = '흐리게 감지된 보호구가 있어요 · 각도·거리를 조절해주세요';
-          } else if (_gloveOneSide) {
-            sub = '⚠ 장갑을 양손에 모두 착용했는지 확인하세요';
+          } else if (_pairMissingMsg != null) {
+            sub = _pairMissingMsg!;
           } else if (_noDetectHint) {
             sub = '인식되지 않아요 · 작업자 전신이 보이게 비춰주세요';
           } else {
@@ -683,6 +742,25 @@ class _InspectionDetectionScreenState extends State<InspectionDetectionScreen> {
         icon = Icons.timer_off_outlined;
         title = '시간 초과 · 인식 실패';
         sub = '보호구가 인식되지 않아 판정할 수 없어요 · 다시 점검해주세요';
+        break;
+      case _InspPhase.retakeWait:
+        color = const Color(0xFFBA7517);
+        icon = Icons.replay;
+        title = '재촬영이 필요해요';
+        sub =
+            '흐리게 감지: ${_outcome?.ambiguousNames.join(", ") ?? ""} · 각도·거리를 조절하고 다시 점검하세요';
+        break;
+      case _InspPhase.adminDecide:
+        color = const Color(0xFF534AB7);
+        icon = Icons.admin_panel_settings;
+        title = '관리자 판단';
+        final o = _outcome;
+        final parts = <String>[
+          '흐리게 감지: ${o?.ambiguousNames.join(", ") ?? ""}',
+          if (o != null && o.missingNames.isNotEmpty)
+            '미착용: ${o.missingNames.join(", ")}',
+        ];
+        sub = parts.join(' · ');
         break;
     }
 
@@ -846,6 +924,50 @@ class _InspectionDetectionScreenState extends State<InspectionDetectionScreen> {
                 const Color(0xFFE24B4A),
                 Colors.white,
                 _save,
+              ),
+            ),
+          ],
+        );
+      case _InspPhase.retakeWait:
+        return Row(
+          children: [
+            Expanded(
+              child: _boxButton(
+                '돌아가기',
+                const Color(0xFF3A3A3A),
+                Colors.white,
+                _goBack,
+              ),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: _boxButton(
+                '다시 점검',
+                Colors.white,
+                const Color(0xFF1A1A1A),
+                _beginRetake,
+              ),
+            ),
+          ],
+        );
+      case _InspPhase.adminDecide:
+        return Row(
+          children: [
+            Expanded(
+              child: _boxButton(
+                '미착용으로 기록',
+                const Color(0xFFE24B4A),
+                Colors.white,
+                _adminRecordMissing,
+              ),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: _boxButton(
+                '착용으로 인정',
+                const Color(0xFF1D9E75),
+                Colors.white,
+                _adminAcceptWorn,
               ),
             ),
           ],

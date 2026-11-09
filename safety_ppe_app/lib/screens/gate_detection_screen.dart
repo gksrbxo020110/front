@@ -12,6 +12,8 @@ import 'ppe_frame_utils.dart';
 import 'ppe_box_overlay.dart';
 import 'ppe_pose.dart';
 import 'api_service.dart';
+import 'ppe_judge.dart';
+import 'admin_password_dialog.dart';
 
 // ─────────────────────────────────────────────
 // 게이트 실시간 감지 설정값
@@ -20,6 +22,7 @@ const int gateTimeoutSeconds = 20; // 제한 시간(초)
 const int detectIntervalMs = 1000; // 감지 간격(ms) — 너무 줄이면 버벅임
 const int resultShowMs = 2000; // 결과 보여주고 다음 사람까지 대기(ms)
 const int maxHoldSeconds = 15; // 노랑·중복으로 타이머를 멈출 수 있는 최대 시간(초)
+const int retakeCountdownSeconds = 3; // 재촬영 전 준비 시간(초) → 지나면 자동으로 다시 감지
 
 // 게이트에서 보고 세는 라벨 (공통 4종 + 턱끈 없는 안전모). 나머지는 무시
 const Set<String> gateLabels = {
@@ -60,7 +63,10 @@ enum _GatePhase {
   saving, // 미착용 저장 중
   saved, // 미착용 저장 완료
   saveFailed, // 저장 실패 (서버 꺼짐 등)
-  lowRecognition, // 20초 동안 초록 감지가 한 번도 없음
+  lowRecognition, // 20초 동안 아무것도 안 보임 (초록·노랑 모두 없음)
+  retakeWait, // 시간 종료 시 노랑(애매) → 재촬영 준비 (3초 뒤 자동 시작)
+  askAdmin, // 재촬영에서도 노랑 → "관리자에게 문의하세요"
+  adminDecide, // 관리자 비밀번호 확인 후 → 미착용 기록 / 착용 인정 선택
 }
 
 // ★ 임시: 확인용 미리보기 썸네일
@@ -129,7 +135,14 @@ class _GateDetectionScreenState extends State<GateDetectionScreen> {
   bool _strapWarning = false; // 턱끈 없는 안전모로 판정됨
   String? _dupLabel; // 이번 프레임 중복 감지된 장비 (여러 명 의심)
   bool _weakPending = false; // 아직 인정 안 된 장비가 노랑으로 보임
-  bool _gloveOneSide = false; // 장갑이 한쪽만 계속 보임
+  String? _pairMissingMsg; // 짝 장비(장갑·안전화·각반)가 한쪽만 보일 때 안내
+
+  // 재촬영·관리자 확인 (팀 결정 11/9)
+  int _attempt = 1; // 1 = 첫 촬영, 2 = 재촬영
+  JudgeOutcome? _outcome; // 시간 종료 판정 (착용·미착용·애매)
+  List<String> _pendingMissing = []; // 저장할 미착용 라벨 (저장 재시도용)
+  Timer? _retakeTimer;
+  int _retakeRemain = retakeCountdownSeconds;
 
   // 타이머를 멈춰야 하는 상황 (노랑 또는 중복)
   bool get _holding => _dupLabel != null || _weakPending;
@@ -216,6 +229,7 @@ class _GateDetectionScreenState extends State<GateDetectionScreen> {
   void dispose() {
     _disposed = true;
     _timer?.cancel();
+    _retakeTimer?.cancel();
     final c = _controller;
     _controller = null;
     if (c != null) {
@@ -251,7 +265,7 @@ class _GateDetectionScreenState extends State<GateDetectionScreen> {
       _strapWarning = false;
       _dupLabel = null;
       _weakPending = false;
-      _gloveOneSide = false;
+      _pairMissingMsg = null;
       _result = PpeRules.evaluate('', <String>{}); // 처음엔 전부 ✗
     });
     _lastRun = DateTime.fromMillisecondsSinceEpoch(0);
@@ -405,7 +419,7 @@ class _GateDetectionScreenState extends State<GateDetectionScreen> {
         _noDetectHint = strongNow.isEmpty;
         _dupLabel = dup;
         _weakPending = weakPending;
-        _gloveOneSide = _filter.pairMissing('safety_gloves');
+        _pairMissingMsg = _filter.pairMissingMessage;
         if (thumb != null) _debugThumb = thumb;
       });
 
@@ -429,24 +443,116 @@ class _GateDetectionScreenState extends State<GateDetectionScreen> {
     _autoNext();
   }
 
-  // ── 20초 끝 ──
+  // ── 20초 끝 → 착용 / 미착용 / 애매 판정 ──
   Future<void> _onTimeout() async {
     if (_phase != _GatePhase.scanning) return;
     await _stopStream();
+    if (!mounted) return;
 
-    if (!_filter.hasAnyStrong) {
-      // 초록 감지가 한 번도 없음 → 저장하지 않고 재시도 안내 (빈 화면 저장 방지)
-      if (mounted) setState(() => _phase = _GatePhase.lowRecognition);
+    if (!_filter.hasAnyVisible) {
+      // 아무것도 안 보임 (초록·노랑 모두 없음) → 저장하지 않고 재시도 안내
+      setState(() => _phase = _GatePhase.lowRecognition);
       return;
     }
     if (_result?.allWorn ?? false) {
       _onPass();
       return;
     }
+
+    final o = judgeAtEnd(
+      workType: '',
+      result: _result!,
+      judgedLabels: _judgedLabels,
+      filter: _filter,
+    );
+    _outcome = o;
+
+    // 애매(노랑) 없음 → 확실한 미착용만 바로 기록
+    if (!o.hasAmbiguous) {
+      _pendingMissing = o.missingLabels;
+      _saveViolation();
+      return;
+    }
+    // 첫 촬영에서 노랑 → 기록 안 하고 재촬영
+    if (_attempt == 1) {
+      _startRetakeCountdown();
+      return;
+    }
+    // 재촬영에서도 노랑 → 관리자에게 문의
+    setState(() => _phase = _GatePhase.askAdmin);
+  }
+
+  // ── 재촬영 준비 (3초 뒤 자동으로 같은 사람 다시 감지, QR 다시 안 찍음) ──
+  void _startRetakeCountdown() {
+    _retakeTimer?.cancel();
+    setState(() {
+      _phase = _GatePhase.retakeWait;
+      _retakeRemain = retakeCountdownSeconds;
+    });
+    _retakeTimer = Timer.periodic(const Duration(seconds: 1), (t) {
+      if (!mounted || _phase != _GatePhase.retakeWait) {
+        t.cancel();
+        return;
+      }
+      if (_retakeRemain <= 1) {
+        t.cancel();
+        _beginRetake();
+        return;
+      }
+      setState(() => _retakeRemain--);
+    });
+  }
+
+  void _beginRetake() {
+    if (!mounted || _phase != _GatePhase.retakeWait) return;
+    _retakeTimer?.cancel();
+    _attempt = 2;
+    _startScan();
+  }
+
+  // ── "관리자에게 문의하세요"에서 [다음 사람] ──
+  // 관리자가 없어도 확실한 미착용은 기록 (애매한 항목만 기록 안 함)
+  void _skipAdmin() {
+    final o = _outcome;
+    if (o != null && o.hasMissing) {
+      _pendingMissing = o.missingLabels;
+      _saveViolation();
+    } else {
+      _goNext();
+    }
+  }
+
+  // ── [관리자 확인] → 비밀번호 → 선택 화면 ──
+  Future<void> _adminConfirm() async {
+    final ok = await showAdminPasswordDialog(context);
+    if (ok && mounted && _phase == _GatePhase.askAdmin) {
+      setState(() => _phase = _GatePhase.adminDecide);
+    }
+  }
+
+  // 관리자: 애매한 장비도 미착용으로 기록
+  void _adminRecordMissing() {
+    final o = _outcome;
+    if (o == null) return;
+    _pendingMissing = o.allMissingLabels;
     _saveViolation();
   }
 
+  // 관리자: 애매한 장비는 착용으로 인정 → 안 보인 장비만 미착용, 없으면 입장 완료
+  void _adminAcceptWorn() {
+    final o = _outcome;
+    if (o == null) return;
+    if (o.hasMissing) {
+      _pendingMissing = o.missingLabels;
+      _saveViolation();
+    } else {
+      setState(() => _phase = _GatePhase.pass);
+      _autoNext();
+    }
+  }
+
   // ── 미착용 저장 (S3 + detections, detectionMode=GATE) ──
+  // 저장할 미착용 라벨은 _pendingMissing (판정 결과 / 관리자 선택에 따라 다름)
   Future<void> _saveViolation() async {
     if (_lastImage == null) {
       if (mounted) setState(() => _phase = _GatePhase.saveFailed);
@@ -485,8 +591,8 @@ class _GateDetectionScreenState extends State<GateDetectionScreen> {
           .where((it) => it['ppeId'] != -1)
           .toList();
 
-      // ② 미착용: 빠진 필수 항목을 worn=false로 (장갑 한쪽만도 여기로 들어감)
-      for (final label in PpeRules.missingLabels('', _judgedLabels)) {
+      // ② 미착용: 판정·관리자 선택에 따른 미착용 항목을 worn=false로 (짝 장비 한쪽만도 포함)
+      for (final label in _pendingMissing) {
         final id = ppeLabels.indexOf(label);
         if (id == -1) continue;
         items.add(<String, dynamic>{
@@ -535,12 +641,37 @@ class _GateDetectionScreenState extends State<GateDetectionScreen> {
     Navigator.pop(context);
   }
 
+  // ── 뒤로가기 (화면 왼쪽 위 / 폰 뒤로가기) ──
+  // 감지 도중 작업자가 뒤로 나가서 미착용 기록을 피하지 못하게, 결과가 끝난 뒤가 아니면 관리자 비밀번호 확인
+  bool _leaving = false;
+  Future<void> _tryLeave() async {
+    if (_phase == _GatePhase.pass || _phase == _GatePhase.saved) {
+      _goNext();
+      return;
+    }
+    if (_leaving) return;
+    _leaving = true;
+    final ok = await showAdminPasswordDialog(
+      context,
+      title: '감지 중단',
+      message: '감지를 중단하려면 관리자 비밀번호를 입력하세요',
+    );
+    _leaving = false;
+    if (ok) _goNext();
+  }
+
   // ─────────────────────────────────────────────
   // UI
   // ─────────────────────────────────────────────
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
+    // 폰 뒤로가기도 같은 규칙 (결과 전이면 관리자 비밀번호)
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, result) {
+        if (!didPop) _tryLeave();
+      },
+      child: Scaffold(
       backgroundColor: const Color(0xFF141414),
       body: SafeArea(
         child: Column(
@@ -551,7 +682,7 @@ class _GateDetectionScreenState extends State<GateDetectionScreen> {
               child: Row(
                 children: [
                   GestureDetector(
-                    onTap: _goNext,
+                    onTap: _tryLeave,
                     child: const Icon(
                       Icons.chevron_left,
                       size: 26,
@@ -653,6 +784,7 @@ class _GateDetectionScreenState extends State<GateDetectionScreen> {
           ],
         ),
       ),
+    ),
     );
   }
 
@@ -669,7 +801,7 @@ class _GateDetectionScreenState extends State<GateDetectionScreen> {
         color = const Color(0xFF534AB7);
         icon = Icons.verified_user;
         title =
-            '인증 완료 · ${widget.verifiedName.isEmpty ? "작업자" : widget.verifiedName}';
+            '${_attempt >= 2 ? "재촬영" : "인증 완료"} · ${widget.verifiedName.isEmpty ? "작업자" : widget.verifiedName}';
         if (_dupLabel != null) {
           // 중복 → 주황 배너 (판정 보류)
           color = const Color(0xFFBA7517);
@@ -680,12 +812,12 @@ class _GateDetectionScreenState extends State<GateDetectionScreen> {
           sub = '⚠ 안전모 턱끈을 착용하세요';
         } else if (_weakPending) {
           sub = '흐리게 감지된 보호구가 있어요 · 가까이, 정면으로 서주세요';
-        } else if (_gloveOneSide) {
-          sub = '⚠ 장갑을 양손에 모두 착용하세요';
+        } else if (_pairMissingMsg != null) {
+          sub = _pairMissingMsg!;
         } else if (_noDetectHint) {
           sub = '인식되지 않아요 · 전신이 화면에 보이게 서주세요';
         } else {
-          sub = '카메라에 전신을 비춰주세요 · 한 명씩 서주세요';
+          sub = '카메라를 정면으로 보고 서주세요 · 전신이 보이게 · 한 명씩';
         }
         showCountdown = _started;
         break;
@@ -718,6 +850,25 @@ class _GateDetectionScreenState extends State<GateDetectionScreen> {
         icon = Icons.replay;
         title = '인식률 낮음';
         sub = '다시 시도해주세요 (각도·거리·조명 확인)';
+        break;
+      case _GatePhase.retakeWait:
+        color = const Color(0xFFBA7517);
+        icon = Icons.replay;
+        title = '재촬영이 필요해요 · $_retakeRemain초 뒤 시작';
+        sub =
+            '흐리게 감지: ${_outcome?.ambiguousNames.join(", ") ?? ""} · 정면에서 전신이 보이게 서주세요';
+        break;
+      case _GatePhase.askAdmin:
+        color = const Color(0xFFBA7517);
+        icon = Icons.support_agent;
+        title = '관리자에게 문의하세요';
+        sub = _adminSubText();
+        break;
+      case _GatePhase.adminDecide:
+        color = const Color(0xFF534AB7);
+        icon = Icons.admin_panel_settings;
+        title = '관리자 판단';
+        sub = _adminSubText();
         break;
     }
 
@@ -781,6 +932,17 @@ class _GateDetectionScreenState extends State<GateDetectionScreen> {
         ],
       ),
     );
+  }
+
+  // 관리자 확인 화면 안내 (애매 / 확실한 미착용)
+  String _adminSubText() {
+    final o = _outcome;
+    if (o == null) return '';
+    final parts = <String>['흐리게 감지: ${o.ambiguousNames.join(", ")}'];
+    if (o.missingNames.isNotEmpty) {
+      parts.add('미착용: ${o.missingNames.join(", ")}');
+    }
+    return parts.join(' · ');
   }
 
   // 카메라 영역
@@ -921,6 +1083,57 @@ class _GateDetectionScreenState extends State<GateDetectionScreen> {
                 Colors.white,
                 const Color(0xFF1A1A1A),
                 _startScan,
+              ),
+            ),
+          ],
+        );
+      case _GatePhase.retakeWait:
+        return _fullButton(
+          '바로 재촬영',
+          Colors.white,
+          const Color(0xFF1A1A1A),
+          _beginRetake,
+        );
+      case _GatePhase.askAdmin:
+        return Row(
+          children: [
+            Expanded(
+              child: _boxButton(
+                '다음 사람',
+                const Color(0xFF3A3A3A),
+                Colors.white,
+                _skipAdmin,
+              ),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: _boxButton(
+                '관리자 확인',
+                Colors.white,
+                const Color(0xFF1A1A1A),
+                _adminConfirm,
+              ),
+            ),
+          ],
+        );
+      case _GatePhase.adminDecide:
+        return Row(
+          children: [
+            Expanded(
+              child: _boxButton(
+                '미착용으로 기록',
+                const Color(0xFFE24B4A),
+                Colors.white,
+                _adminRecordMissing,
+              ),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: _boxButton(
+                '착용으로 인정',
+                const Color(0xFF1D9E75),
+                Colors.white,
+                _adminAcceptWorn,
               ),
             ),
           ],
