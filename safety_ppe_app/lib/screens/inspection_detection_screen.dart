@@ -94,6 +94,12 @@ class _InspectionDetectionScreenState extends State<InspectionDetectionScreen> {
   int _imgW = 0;
   int _imgH = 0;
   img.Image? _lastImage;
+  // 관리자 판단용 사진 (팀 결정 11/10)
+  //  - 노랑(애매)이 보인 마지막 프레임을 기억해 두었다가 관리자 화면에 멈춘 사진으로 보여줌
+  //  - 관리자가 카메라 앞을 가려도 판단 근거가 그대로 + 저장도 이 사진 그대로 (본 사진 = 기록 사진)
+  img.Image? _weakImage; // 노랑이 보인 마지막 프레임
+  List<Detection> _weakShown = []; // 그 프레임의 초록+노랑
+  Uint8List? _judgePhoto; // 박스 그린 판정 사진 (JPG)
 
   InspectionResult? _result;
   Set<String> _judgedLabels = {}; // 실제 판정에 쓴 라벨 (턱끈 처리 후) → 저장 items 기준
@@ -185,7 +191,7 @@ class _InspectionDetectionScreenState extends State<InspectionDetectionScreen> {
   }
 
   // ── 미착용·애매 판정 (시간 종료·점검 완료 공통, 스트림은 이미 멈춘 상태) ──
-  void _judgeEnd() {
+  Future<void> _judgeEnd() async {
     final o = judgeAtEnd(
       workType: widget.workType,
       result: _result!,
@@ -205,7 +211,9 @@ class _InspectionDetectionScreenState extends State<InspectionDetectionScreen> {
       setState(() => _phase = _InspPhase.retakeWait);
       return;
     }
-    // 재촬영에서도 노랑 → 관리자 판단
+    // 재촬영에서도 노랑 → 판정 사진을 멈춰 보여주고 관리자 판단
+    await _makeJudgePhoto();
+    if (!mounted) return;
     setState(() => _phase = _InspPhase.adminDecide);
   }
 
@@ -333,6 +341,9 @@ class _InspectionDetectionScreenState extends State<InspectionDetectionScreen> {
       _detections = [];
       _lastShown = [];
       _lastImage = null;
+      _weakImage = null;
+      _weakShown = [];
+      _judgePhoto = null;
       _judgedLabels = {};
       _noDetectHint = false;
       _strapWarning = false;
@@ -406,6 +417,10 @@ class _InspectionDetectionScreenState extends State<InspectionDetectionScreen> {
         _imgH = image.height;
         _detections = results; // 박스 표시용 (작업별 필수만, 40% 미만은 그릴 때 걸러짐)
         _lastShown = results.where(PpeRealtimeFilter.isVisible).toList();
+        if (weakPending) {
+          _weakImage = image;
+          _weakShown = _lastShown;
+        }
         _result = result;
         _noDetectHint = strongNow.isEmpty;
         _dupLabel = dup;
@@ -468,7 +483,7 @@ class _InspectionDetectionScreenState extends State<InspectionDetectionScreen> {
 
   // ── 저장 (B안: 미착용일 때만 여기로 옴 — _finish에서 걸러짐) ──
   Future<void> _save() async {
-    if (_lastImage == null) {
+    if (_judgePhoto == null && _lastImage == null) {
       if (mounted) setState(() => _phase = _InspPhase.saveFailed);
       return;
     }
@@ -477,10 +492,13 @@ class _InspectionDetectionScreenState extends State<InspectionDetectionScreen> {
 
     try {
       // 박스(초록+노랑, 작업별 필수만) 그린 사진 (iOS와 동일, 라벨 겹침 방지 포함)
-      final bytes = await compute(
-        drawBoxesAndEncode,
-        await BurnData.fromDetectionsKo(_lastImage!, _lastShown), // 한글 라벨
-      );
+      // 관리자 화면에서 본 판정 사진이 있으면 그 사진 그대로 저장 (본 사진 = 기록 사진)
+      final Uint8List bytes =
+          _judgePhoto ??
+          await compute(
+            drawBoxesAndEncode,
+            await BurnData.fromDetectionsKo(_lastImage!, _lastShown), // 한글 라벨
+          );
 
       final urlRes = await ApiService.getS3UploadUrl();
       String? s3Key;
@@ -823,6 +841,47 @@ class _InspectionDetectionScreenState extends State<InspectionDetectionScreen> {
     );
   }
 
+  // ── 판정 사진 만들기 (노랑이 보인 프레임 우선, 없으면 마지막 프레임) ──
+  Future<void> _makeJudgePhoto() async {
+    final src = _weakImage ?? _lastImage;
+    if (src == null) return;
+    final shown = _weakImage != null ? _weakShown : _lastShown;
+    try {
+      _judgePhoto = await compute(
+        drawBoxesAndEncode,
+        await BurnData.fromDetectionsKo(src, shown), // 한글 라벨
+      );
+    } catch (e) {
+      debugPrint('판정 사진 만들기 오류: $e');
+    }
+  }
+
+  // 관리자 화면: 실시간 카메라 대신 판정 사진
+  Widget _buildJudgePhoto(Uint8List photo) {
+    return Stack(
+      children: [
+        Positioned.fill(
+          child: Image.memory(photo, fit: BoxFit.contain, gaplessPlayback: true),
+        ),
+        Positioned(
+          left: 10,
+          top: 10,
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+            decoration: BoxDecoration(
+              color: Colors.black54,
+              borderRadius: BorderRadius.circular(6),
+            ),
+            child: const Text(
+              '판정 순간 사진 · 미착용 기록 시 이 사진으로 저장',
+              style: TextStyle(color: Colors.white, fontSize: 12),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
   // 카메라 영역
   Widget _buildCameraArea() {
     final c = _controller;
@@ -845,6 +904,12 @@ class _InspectionDetectionScreenState extends State<InspectionDetectionScreen> {
           ],
         ),
       );
+    }
+
+    // 관리자 판단 중 → 실시간 화면 대신 판정 사진 (관리자가 카메라 앞을 가려도 그대로)
+    final photo = _judgePhoto;
+    if (photo != null && (_phase == _InspPhase.adminDecide)) {
+      return _buildJudgePhoto(photo);
     }
 
     return LayoutBuilder(

@@ -127,6 +127,12 @@ class _GateDetectionScreenState extends State<GateDetectionScreen> {
   int _imgW = 0;
   int _imgH = 0;
   img.Image? _lastImage; // 마지막 프레임 (미착용 캡처용)
+  // 관리자 판단용 사진 (팀 결정 11/10)
+  //  - 노랑(애매)이 보인 마지막 프레임을 기억해 두었다가 관리자 화면에 멈춘 사진으로 보여줌
+  //  - 관리자가 카메라 앞을 가려도 판단 근거가 그대로 + 저장도 이 사진 그대로 (본 사진 = 기록 사진)
+  img.Image? _weakImage; // 노랑이 보인 마지막 프레임
+  List<Detection> _weakShown = []; // 그 프레임의 초록+노랑
+  Uint8List? _judgePhoto; // 박스 그린 판정 사진 (JPG)
   Uint8List? _debugThumb; // ★ 임시: 확인용 미리보기
 
   InspectionResult? _result;
@@ -260,6 +266,9 @@ class _GateDetectionScreenState extends State<GateDetectionScreen> {
       _posePoints = [];
       _missingRegions = [];
       _lastImage = null;
+      _weakImage = null;
+      _weakShown = [];
+      _judgePhoto = null;
       _judgedLabels = {};
       _noDetectHint = false;
       _strapWarning = false;
@@ -413,6 +422,10 @@ class _GateDetectionScreenState extends State<GateDetectionScreen> {
         _imgH = image.height;
         _detections = results; // 박스 표시용 (40% 미만은 그릴 때 걸러짐)
         _lastShown = results.where(PpeRealtimeFilter.isVisible).toList();
+        if (weakPending) {
+          _weakImage = image;
+          _weakShown = _lastShown;
+        }
         _posePoints = posePoints;
         _missingRegions = missing;
         _result = result;
@@ -478,7 +491,9 @@ class _GateDetectionScreenState extends State<GateDetectionScreen> {
       _startRetakeCountdown();
       return;
     }
-    // 재촬영에서도 노랑 → 관리자에게 문의
+    // 재촬영에서도 노랑 → 판정 사진을 멈춰 보여주고 관리자에게 문의
+    await _makeJudgePhoto();
+    if (!mounted) return;
     setState(() => _phase = _GatePhase.askAdmin);
   }
 
@@ -554,7 +569,7 @@ class _GateDetectionScreenState extends State<GateDetectionScreen> {
   // ── 미착용 저장 (S3 + detections, detectionMode=GATE) ──
   // 저장할 미착용 라벨은 _pendingMissing (판정 결과 / 관리자 선택에 따라 다름)
   Future<void> _saveViolation() async {
-    if (_lastImage == null) {
+    if (_judgePhoto == null && _lastImage == null) {
       if (mounted) setState(() => _phase = _GatePhase.saveFailed);
       return;
     }
@@ -563,10 +578,13 @@ class _GateDetectionScreenState extends State<GateDetectionScreen> {
     try {
       // 마지막 프레임에 박스(초록+노랑) 그려서 JPG로 (공통 파일, 라벨 겹침 방지 포함)
       // 저장 사진은 실제 방향(좌우 반전 없음)
-      final bytes = await compute(
-        drawBoxesAndEncode,
-        await BurnData.fromDetectionsKo(_lastImage!, _lastShown), // 한글 라벨
-      );
+      // 관리자 화면에서 본 판정 사진이 있으면 그 사진 그대로 저장 (본 사진 = 기록 사진)
+      final Uint8List bytes =
+          _judgePhoto ??
+          await compute(
+            drawBoxesAndEncode,
+            await BurnData.fromDetectionsKo(_lastImage!, _lastShown), // 한글 라벨
+          );
 
       final urlRes = await ApiService.getS3UploadUrl();
       String? s3Key;
@@ -945,6 +963,47 @@ class _GateDetectionScreenState extends State<GateDetectionScreen> {
     return parts.join(' · ');
   }
 
+  // ── 판정 사진 만들기 (노랑이 보인 프레임 우선, 없으면 마지막 프레임) ──
+  Future<void> _makeJudgePhoto() async {
+    final src = _weakImage ?? _lastImage;
+    if (src == null) return;
+    final shown = _weakImage != null ? _weakShown : _lastShown;
+    try {
+      _judgePhoto = await compute(
+        drawBoxesAndEncode,
+        await BurnData.fromDetectionsKo(src, shown), // 한글 라벨
+      );
+    } catch (e) {
+      debugPrint('판정 사진 만들기 오류: $e');
+    }
+  }
+
+  // 관리자 화면: 실시간 카메라 대신 판정 사진
+  Widget _buildJudgePhoto(Uint8List photo) {
+    return Stack(
+      children: [
+        Positioned.fill(
+          child: Image.memory(photo, fit: BoxFit.contain, gaplessPlayback: true),
+        ),
+        Positioned(
+          left: 10,
+          top: 10,
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+            decoration: BoxDecoration(
+              color: Colors.black54,
+              borderRadius: BorderRadius.circular(6),
+            ),
+            child: const Text(
+              '판정 순간 사진 · 미착용 기록 시 이 사진으로 저장',
+              style: TextStyle(color: Colors.white, fontSize: 12),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
   // 카메라 영역
   Widget _buildCameraArea() {
     final c = _controller;
@@ -967,6 +1026,14 @@ class _GateDetectionScreenState extends State<GateDetectionScreen> {
           ],
         ),
       );
+    }
+
+    // 관리자 판단 중 → 실시간 화면 대신 판정 사진 (관리자가 카메라 앞을 가려도 그대로)
+    final photo = _judgePhoto;
+    if (photo != null &&
+        (_phase == _GatePhase.askAdmin ||
+            _phase == _GatePhase.adminDecide)) {
+      return _buildJudgePhoto(photo);
     }
 
     return LayoutBuilder(
